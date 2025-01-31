@@ -1,7 +1,7 @@
 // server/src/index.ts
 import express from 'express';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
 import mongoose from 'mongoose';
 import Redis from 'ioredis';
 import dotenv from 'dotenv';
@@ -9,9 +9,19 @@ import Group from './models/Group';
 import Chat from './models/Chat';
 import User from './models/User';
 
+// Define message type
+interface MessageType {
+    _id: string;
+    message: string;
+    sender: { address: string };
+    createdAt: Date | string;
+    groupId: string;
+}
+
 interface ServerToClientEvents {
-    message: (message: any) => void;
+    message: (message: MessageType) => void;
     connectionEstablished: (data: { connectionId: string }) => void;
+    error: (error: string) => void;
 }
 
 interface ClientToServerEvents {
@@ -20,6 +30,18 @@ interface ClientToServerEvents {
     sendMessage: (data: { groupId: string; message: string }) => void;
     getGroups: (callback: (groups: any[]) => void) => void;
     createGroup: (data: { name: string; description?: string }, callback: (group: any) => void) => void;
+    loadMessages: (data: { groupId: string; before?: string }, callback: (messages: MessageType[]) => void) => void;
+}
+
+interface InterServerEvents {
+    ping: () => void;
+}
+
+interface SocketData {
+    user: {
+        _id: mongoose.Types.ObjectId;
+        address: string;
+    };
 }
 
 // Load environment variables
@@ -34,7 +56,7 @@ if (!MONGODB_URI) {
 
 const app = express();
 const httpServer = createServer(app);
-const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
+const io = new Server<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>(httpServer, {
     cors: {
         origin: "*",
         methods: ["*"],
@@ -145,7 +167,6 @@ const setupSocketIO = () => {
             connectionId: socket.id
         });
 
-        // Your existing socket event handlers remain the same...
         socket.on('getGroups', async (callback) => {
             try {
                 const allGroups = await Group.find({ isPrivate: false })
@@ -169,7 +190,27 @@ const setupSocketIO = () => {
             }
         });
 
-        socket.on('joinGroup', async (groupId: string) => {
+        socket.on('createGroup', async (data, callback) => {
+            try {
+                const group = await Group.create({
+                    name: data.name,
+                    description: data.description,
+                    owner: user._id,
+                    members: [user._id],
+                    isPrivate: false
+                });
+
+                await group.populate('owner', 'address');
+                await group.populate('members', 'address');
+
+                callback(group);
+            } catch (error) {
+                console.error('Error creating group:', error);
+                callback(null);
+            }
+        });
+
+        socket.on('joinGroup', async (groupId) => {
             try {
                 await redisHelpers.addUserToGroup(groupId, socket.id, user.address);
 
@@ -182,10 +223,72 @@ const setupSocketIO = () => {
                 await socket.join(groupId);
             } catch (error) {
                 console.error('Error joining group:', error);
+                socket.emit('error', 'Failed to join group');
             }
         });
 
-        // Rest of your socket event handlers...
+        socket.on('leaveGroup', async (groupId) => {
+            try {
+                await redisHelpers.removeUserFromGroup(groupId, socket.id);
+                await socket.leave(groupId);
+            } catch (error) {
+                console.error('Error leaving group:', error);
+                socket.emit('error', 'Failed to leave group');
+            }
+        });
+
+        socket.on('sendMessage', async (data) => {
+            try {
+                const chat = await Chat.create({
+                    message: data.message,
+                    sender: user._id,
+                    groupId: data.groupId
+                });
+
+                await chat.populate('sender', 'address');
+
+                const messageData: MessageType = {
+                    _id: chat._id.toString(),
+                    message: chat.message,
+                    sender: { address: user.address },
+                    createdAt: chat.createdAt,
+                    groupId: chat.groupId.toString()
+                };
+
+                io.to(data.groupId).emit('message', messageData);
+            } catch (error) {
+                console.error('Error sending message:', error);
+                socket.emit('error', 'Failed to send message');
+            }
+        });
+
+        socket.on('loadMessages', async (data, callback) => {
+            try {
+                const query = {
+                    groupId: data.groupId,
+                    isDeleted: false,
+                    ...(data.before && { _id: { $lt: data.before } })
+                };
+
+                const messages = await Chat.find(query)
+                    .populate('sender', 'address')
+                    .sort({ createdAt: -1 })
+                    .limit(50);
+
+                const formattedMessages = messages.map(msg => ({
+                    _id: msg._id.toString(),
+                    message: msg.message,
+                    sender: { address: msg.sender.address },
+                    createdAt: msg.createdAt,
+                    groupId: msg.groupId.toString()
+                }));
+
+                callback(formattedMessages);
+            } catch (error) {
+                console.error('Error loading messages:', error);
+                callback([]);
+            }
+        });
 
         socket.on('disconnect', async () => {
             await redisHelpers.cleanup(socket.id);
